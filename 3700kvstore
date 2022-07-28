@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+
+#Class to represent a node or replica
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        #for some reason this is weird between os
+        self.leader_heartbeat = 0.003 # send every 3 ms
+        self.last_beat = time.time() #time of last heartbeat
+
+        #table for key value pairs
+        self.table = {} 
+
+        self.timeout = random.uniform(0.3,0.5) #select a random election timeout 
+
+        #startup state of replica
+        self.leader = 'FFFF' #leader of replica
+        self.term = 0 #current term of leader
+        self.status = "Follower" #status of replica
+        self.has_leader = False #does the program have a leader?
+        self.log = [] #the log of the current replica
+        self.voted_for = None #who we voted for during an election
+        self.votes_received = [] #number of votes received during election
+        self.sent_length = {} #what we think we've sent to other replicas
+        self.acked_length = {} #what has been acknowledged by other replicas
+        self.time = time.time() #last recorded time of replica
+        self.commit_length = 0 #how much replica has committed
+
+        self.send2 = 0 #used for sending replicate logs every couple of log updates
+
+        self.nodes = len(self.others) + 1 #no. of replicas in network
+        
+        self.in_election = False
+        #queue of messages in case no leader, what for leader before redirect or execute 
+        self.queue = []
+
+        #track messages sent already in case they were skipped for any reason
+        self.sent = []  
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+
+    #initiate election process. Occurs when election timeout passes. Follower declares
+    #themselves to be a candidate and starts and election and votes for themselves. Candidate
+    #sends out vote requests to every node in the network and waits 40 ms for responses.
+    #If candidate receives a majority of votes, they become the new leader.
+    #None -> None
+    def election(self):
+        self.term += 1
+        self.in_election = True
+        self.status = "Candidate"
+        self.voted_for = self.id #vote for self
+        self.votes_received = [self.id]
+        last_term = 0 #last term is previous leader
+        if len(self.log) > 0:
+            last_term = self.log[len(self.log) - 1]['term']
+
+        send_msg = {"type" : "vote_req", "cID" : self.id, "cTerm": self.term, "log_len" : len(self.log), "log_term" : last_term}
+        send_msg["leader"] = 'FFFF' #need this for grader idk why
+        send_msg["src"] = self.id
+        send_msg["dst"] = 'FFFF'
+        self.send(send_msg) #send voter requests to all the other nodes
+        
+        current_time = time.time()#Time to count time for election
+        election_timeout = 0.4 #arbitrary time, can change later
+        while time.time() - current_time < election_timeout and self.in_election:
+            #recieve ballots and handle them
+            self.handle_votes()
+
+        #reset timer
+        self.time = time.time()
+
+    #Function handle incoming ballots from other nodes. Tallies ballots and if candidate
+    #has a majority of votes, candidate becomes the leader. If candidate heres an rpc with
+    #a higher term number than current than candidate steps down and becomes a follower or just
+    #hears a response with higher term number. Throws out other vote reqs.
+    #None -> None
+    def handle_votes(self):
+        data, addr = self.socket.recvfrom(200000)
+        msg = data.decode('utf-8')
+        msg_dict = json.loads(msg)
+        #make sure we get a message meant for us
+        if(msg_dict["src"] == self.id or msg_dict["dst"] != self.id):
+            return
+        
+        #a voter response arrived
+        if(msg_dict["type"] == "vote_resp"):
+            if self.status == "Candidate" and self.term == msg_dict["cTerm"] and msg_dict["voted_for"]:
+                if msg_dict["vID"] not in self.votes_received:
+                    self.votes_received.append(msg_dict["vID"])
+                #case if we have the majority
+                if len(self.votes_received) >= (self.nodes + 1)/2 :
+                    print("ELECTION WON", flush = True)
+                    self.status = "Leader"
+                    self.leader = self.id
+                    self.in_election = False
+                    self.acked_length[self.id] = len(self.log)
+                    for node in self.others:
+                        self.sent_length[node] = len(self.log) #We believe other replicas have the same data as us
+                        self.acked_length[node] = 0
+                    self.replicate_log()
+            elif msg_dict["cTerm"] > self.term: #check that our candidacy isnt out of date
+                self.term = msg_dict["cTerm"]
+                self.status = "Follower"
+                self.voted_for = None
+                self.in_election = False
+        elif(msg_dict["type"] == "RPC"): #if better rpc than step down
+            if msg_dict["cTerm"] > self.term:
+                self.term = msg_dict["cTerm"]
+                self.status = "Follower"
+                self.voted_for = None
+                self.in_election = False
+                self.handle_rpc(msg)
+                self.time = time.time()
+        elif msg_dict["type"] == "vote_req": #just check out other vote reqs
+            return
+        else: #deal with other message after figuring out election
+            self.queue.append(msg_dict)
+    
+    #Send new log entries to send to the given replica. Send only what hasn't been sent yet
+    #or other risk clogging socket. Message also acts as a heartbeat
+    #String(ID of node to send to) -> None
+    def replicate_log_msg(self,node_id):
+        send_msg = {"type": "RPC", "leader" : self.leader, "cTerm" : self.term}
+        send_msg["src"] = self.id
+        send_msg["dst"] = node_id #send to only given node
+
+        prefix_len = self.sent_length[node_id] #what we think we've sent already
+        suffix = self.log[prefix_len:]
+
+        prefix_term = 0
+        if prefix_len > 0:
+            prefix_term = self.log[prefix_len - 1]['term']
+        
+        send_msg['prefix_len'] = prefix_len
+        send_msg['prefix_term'] = prefix_term
+        send_msg['commit_len'] = self.commit_length
+        send_msg['suffix'] = suffix
+
+        self.send(send_msg)
+
+    
+    #A copy of the previous method replicate_log_msg. This method instead
+    #sends a replicate log message to every single replica rather than a specific one.
+    #None -> None
+    def replicate_log(self):
+        for i in self.others:
+           self.replicate_log_msg(i)
+
+    
+    #Method that deals with handling vote requests. Votes for a candidate as long as the replica
+    #has not voted yet, the candidates log is okay, and the candidates term is at least better than ours.
+    #Dict(Vote Req) -> None
+    def send_vote(self, msg):
+        self.time = time.time()
+        if msg["cTerm"] > self.term:
+            self.term = msg["cTerm"]
+            self.status == "Follower"
+            self.voted_for = None
+
+        last_term = 0
+        if len(self.log) > 0:
+            last_term = self.log[len(self.log) - 1]['term']
+        log_ok = (msg["log_term"] > last_term) or (msg["log_term"] == last_term and msg["log_len"] >= len(self.log))
+
+        #craft response to send back
+        send_msg = {"type": "vote_resp", "vID" : self.id, "cTerm" : self.term}
+        send_msg["src"] = self.id
+        send_msg["dst"] = msg["src"]
+        send_msg["leader"] = 'FFFF'
+        if self.term == msg["cTerm"] and log_ok and (self.voted_for == msg['cID'] or self.voted_for == None):
+            self.voted_for = msg["cID"]
+            send_msg["voted_for"] = True
+        else:
+            send_msg["voted_for"] = False
+        #send response to sender
+        self.send(send_msg)
+ 
+
+
+    #The intervals in which we send replica messages per messages received by leader
+    #in order to reduce the number of replica messages in the system.
+    #None -> Boolean(Send)
+    def send_interv(self):
+        primes = [2,3]
+        for i in primes:
+            if self.send2 % i == 0:
+                return True
+        return False
+
+    #Leader handling a get or put request from client. Leader puts put messages
+    #in its log and waits for consensus before committing while it immediately executes
+    #get messages since they dont say anything about the state.
+    #Dict(Get/Put Request) -> None
+    def leader_handle_msg(self,msg):
+         #append msg to log
+        if self.leader == self.id:
+            if(msg['type'] == 'put'):
+                self.append_log(msg)
+            elif msg['type'] == 'get': 
+                self.leader_execute(msg)
+            self.acked_length[self.id] = len(self.log)
+            if self.send_interv(): 
+                self.replicate_log()
+                self.send2 += 1
+        
+    #Method for handling actually executing commands for the leader.
+    #Leader executes command if put and stores change to state.
+    #sends value in get request.
+    #Dict(Get/Put Request) -> None
+    def leader_execute(self,msg):
+        if(msg in self.sent):
+            return
+        if(msg["type"] == "put"):
+            self.table[msg['key']] = msg['value']
+            send_msg = {"src" : msg["dst"], "dst" : msg["src"], "leader" : self.leader ,
+                "type" : "ok", "MID" : msg["MID"]}                
+            self.send(send_msg)
+        
+        if(msg["type"] == "get"):
+            val = ''
+            if msg['key'] in self.table: # get val if it exists
+                val = self.table[msg['key']]
+            send_msg = {"src" : msg["dst"], "dst" : msg["src"], "leader" : self.leader ,
+                "type" : "ok", "MID" : msg["MID"], "value" : val}
+            self.send(send_msg)
+        self.sent.append(msg)
+        
+        
+
+    #send failed message for whatever reason
+    #This is unused in the code since we elected to just
+    #store messages instead of fail them.
+    #Dict(Get/Put request) -> None
+    def send_fail(self,msg):
+        send_msg = msg
+        send_msg["dst"] = msg["src"]
+        send_msg["src"] = self.id
+        send_msg["type"] = 'fail'
+        send_msg['leader'] = self.leader
+        self.send(send_msg)
+    
+    #append the given put/get req to log
+    #structures entry as a dict with a msg and a term
+    #with the term being the replicas current term.
+    #Dict(Get/Put request) -> None
+    def append_log(self,msg):
+        self.log.append({'msg' : msg, 'term' : self.term})
+    
+    #redirect the given message to who we think is the leader
+    #sends the message back to the client and tells the client
+    #who the replica thinks is the leader
+    #Dict(Get/Put request) -> None
+    def redirect(self,msg):
+        if(msg["type"] == "put" or msg["type"] == "get"):
+            send_msg = msg
+            send_msg["dst"] = msg["src"]
+            send_msg["src"] = self.id
+            send_msg["leader"] = self.leader
+            send_msg["type"] = "redirect"
+            send_msg["MID"] = msg["MID"]
+            self.send(send_msg)
+    
+    #Handle receiving an rpc and modifying/updating the log in response
+    #before updating any new logs, ensures that the log is up to date and we have
+    #what the leader believes they sent us. If not tell the leader we can't append to 
+    #log, else tell the leader we can and then append the entries.
+    #Dict(Get/Put request) -> None
+    def handle_rpc(self,msg):
+        try:
+            if(msg["cTerm"] > self.term):
+                self.term = msg["cTerm"] 
+                self.voted_for = None
+                self.time = time.time()
+            if(msg["cTerm"] == self.term):
+                self.status  = 'Follower'
+                self.leader = msg["leader"]
+                self.has_leader = True
+                #self.time = time.time() #reset election timer
+        except:
+            return
+        
+        #guarentee log is formed properly
+        log_ok = ((len(self.log) >= msg['prefix_len']) and (msg['prefix_len'] == 0 or self.log[msg['prefix_len'] - 1]['term'] == msg['prefix_term']))
+        
+        send_msg = {'type' : "RPC_resp", 'ID' : self.id, 'cTerm' : self.term}
+        send_msg['leader'] = self.leader
+        send_msg['src'] = self.id
+        send_msg['dst'] = msg['leader'] #send back to leader that we got rpc
+        send_msg['ack'] = 0 #
+        send_msg['append'] = False #if we could append data or not to log
+        if self.term == msg["cTerm"] and log_ok:
+            self.append_entries(msg) #deal with appending new entries to log
+            send_msg['ack'] = msg['prefix_len'] + len(msg['suffix']) #how many entries we now have
+            send_msg['append'] = True
+        self.send(send_msg) #send rpc resp
+    
+    #append log entries from the given AppendEntries RPC.
+    #Repairs the log if needed and appends all the new entries in the RPC
+    #to the current replica log. Also commits all changes which the leader
+    #has committed in the time since the last RPC
+    #Dict(AppendEntries RPC) -> None
+    def append_entries(self,msg):
+        #repairing log if it is somehow not in sync with leader
+        if len(msg['suffix']) > 0 and len(self.log) > msg['prefix_len']:
+            index = min(len(self.log), msg['prefix_len'] + len(msg['suffix'])) - 1
+            if self.log[index]['term'] != msg['suffix'][index - msg['prefix_len']]['term']:
+                self.log = self.log[:msg['prefix_len'] - 1]
+        #append new entries
+        if msg['prefix_len'] + len(msg['suffix']) > len(self.log):
+            for i in range(len(self.log) - msg['prefix_len'], len(msg['suffix'])):
+                self.log.append(msg['suffix'][i]) #appending new entries to log
+        if msg['commit_len'] > self.commit_length: #commit stuff leader has committed
+            for i in range(self.commit_length, min(msg['commit_len'],len(self.log))):
+                self.follower_commit(self.log[i]['msg'])
+
+            self.commit_length = msg['commit_len'] #all up to date 
+    
+    #A follower commit is only a put since that is what
+    #affects the state of the machine. Follower only commits put
+    #to state and does not tell the client anything.
+    #Dict(Put request) -> None
+    def follower_commit(self, msg):        
+        if msg['type'] == 'put':
+            self.table[msg['key']] = msg['value']
+
+
+    #A Leader handling RPC responses from followers.
+    #A Leader checks if the follower was able to append entries and if so
+    #the leader stores that the follower acked the mesages back to us and we then check
+    #if we can commit any changes using that information. If the follower was unable to,
+    #the leader sends previous entries to the Follower until a match is found
+    #If for some reason the follower has a higher term than us, we abdicate and become 
+    #a follower
+    #Dict(RPC response) -> None
+    def handle_rpc_resp(self,msg):
+        if msg["cTerm"] == self.term and self.leader == self.id:
+            #check that appending worked and
+            if msg['append'] and msg['ack'] >= self.acked_length[msg['ID']]:
+                self.sent_length[msg['ID']] = msg['ack']
+                self.acked_length[msg['ID']] = msg['ack']
+                self.leader_commit()
+            elif self.sent_length[msg['ID']] > 0:
+                if(self.sent_length[msg['ID']] - 3 > 0): #try to accelerate a fix
+                    self.sent_length[msg['ID']] -= 2
+                self.sent_length[msg['ID']] -= 1
+                self.replicate_log_msg(msg['ID'])
+        elif msg["cTerm"] > self.term:
+            self.term = msg["cTerm"] 
+            self.status = 'Follower'
+            self.voted_for = None
+            self.time = time.time()
+
+
+    #Method to check if a leader can commit entries in a log.
+    #Method checks all the acks of other nodes and checks if a majority
+    #have a greater ack than the current commit length. If so increment commit length
+    #and execute log entry and repeat until no more entries can be committed.
+    #None -> None
+    def leader_commit(self):
+        while self.commit_length < len(self.log):
+            acks = 0
+            nodes_all = [self.id]
+            nodes_all.extend(self.others)
+            for i in nodes_all:
+                if self.acked_length[i] > self.commit_length:
+                    acks += 1
+            if acks > (self.nodes)/2:
+                self.leader_execute(self.log[self.commit_length]['msg'])
+                self.commit_length += 1
+            else:
+                return
+
+
+    #Election protocols to set up an election. Initiates an election
+    #and deals with the cleanup up after an election
+    #None -> None
+    def election_protocol(self):
+        self.has_leader = False
+        self.election()
+        #select new election timeout
+        self.timeout = random.uniform(0.3,0.5) 
+        self.voted_for = None
+        self.votes_received = [] #reset votes received
+        self.time = time.time() # wait out new timeout
+
+
+    #run program
+    def run(self):
+        while True:
+            if self.leader == self.id and time.time() - self.last_beat >= self.leader_heartbeat:
+                self.replicate_log()
+                self.last_beat = time.time()
+
+            #on startup or election timeout start election
+            if (time.time() - self.time > self.timeout) and self.status != "Leader":
+                self.election_protocol()
+                continue
+
+            #handle queue entries if leader
+            #redirect if has leader
+            for entry in self.queue:
+                if self.leader == self.id:
+                    self.leader_handle_msg(entry)
+                    self.queue.remove(entry)
+                elif self.has_leader:
+                    self.redirect(entry)
+                    self.queue.remove(entry)
+
+            data, addr = self.socket.recvfrom(200000)       
+            msg = data.decode('utf-8')
+            msg_dict = json.loads(msg)
+            #any message from leader means leader is still alive, an extra hearbeat kinda
+            if (msg_dict["src"] == self.leader):
+                self.time = time.time() 
+            if(msg_dict["src"] == self.id or (msg_dict["dst"] != self.id and msg_dict["dst"] != 'FFFF')):
+                continue #only take message if meant for replica
+            if(msg_dict["type"] == "RPC"): #heartbeat from a leader, and potentially new log entries
+                self.handle_rpc(msg_dict)
+                continue
+            if(msg_dict["type"] == "vote_req"): #someone asking for vote 
+                self.time = time.time() #reset our time
+                self.send_vote(msg_dict)
+                continue
+            if(self.has_leader == False and self.leader != self.id): #Leaderless, wait until leader is found then deal with queue
+                if(msg_dict["type"] != "vote_resp"):
+                    self.queue.append(msg_dict)
+                continue
+            if(msg_dict['type'] == "RPC_resp" and self.leader == self.id):
+                self.handle_rpc_resp(msg_dict) #leader handle follower responses to rpcs
+                continue
+            if(self.status == 'Follower'): #redirect message to assumed leader
+                self.redirect(msg_dict)
+                continue
+            self.leader_handle_msg(msg_dict) #leader handling message puts and gets
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
